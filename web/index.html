@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Port Scanner</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="page">
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <div>
+          <h1>Port Scanner</h1>
+          <p>TCP connect scan with banner grabbing</p>
+        </div>
+      </div>
+      <p class="pill">This machine only</p>
+    </header>
+
+    <form id="scan-form" class="panel">
+      <div class="target-row">
+        <label class="field grow">
+          <span>Target</span>
+          <input id="host" name="host" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false" placeholder="hostname or IP" required>
+        </label>
+        <button id="scan" class="scan-btn" type="submit">Scan</button>
+      </div>
+
+      <label class="field">
+        <span>Ports</span>
+        <input id="ports" name="ports" type="text" value="1-1024" autocomplete="off" spellcheck="false" placeholder="1-1024 or 22,80,443" required>
+      </label>
+
+      <div class="presets" role="group" aria-label="Port presets">
+        <button type="button" data-preset="common">Common</button>
+        <button type="button" data-preset="wellknown" aria-pressed="true">Well-known</button>
+        <button type="button" data-preset="all">All ports</button>
+        <p id="port-count" class="count">1,024 ports</p>
+      </div>
+
+      <div class="controls">
+        <label class="field">
+          <span>Threads</span>
+          <input id="threads" name="threads" type="number" min="1" max="200" step="1" value="100" required>
+        </label>
+        <label class="field">
+          <span>Timeout, seconds</span>
+          <input id="timeout" name="timeout" type="number" min="0.1" max="5" step="0.1" value="0.5" required>
+        </label>
+      </div>
+
+      <p class="note">Only scan machines you own or have permission to test. A filtered port waits for the full timeout.</p>
+      <p id="error" class="error" role="alert" hidden></p>
+    </form>
+
+    <section class="panel results" aria-labelledby="status">
+      <div class="results-head">
+        <div>
+          <h2 id="status">No scan yet</h2>
+          <p id="detail">Open ports show up here as the scan finds them.</p>
+        </div>
+        <div class="results-actions">
+          <button type="button" id="copy" disabled>Copy</button>
+          <button type="button" id="csv" disabled>Download CSV</button>
+        </div>
+      </div>
+
+      <div class="progress" id="progress" hidden>
+        <span id="bar"></span>
+      </div>
+
+      <div class="table-tools">
+        <label class="filter-label">
+          <span class="sr-only">Filter open ports</span>
+          <input id="filter" type="search" placeholder="Filter by port, service, or banner" disabled>
+        </label>
+      </div>
+
+      <div class="table-wrap" id="table-wrap" hidden>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Port</th>
+              <th scope="col">Service</th>
+              <th scope="col">Banner</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <p id="empty" class="empty">Nothing scanned yet.</p>
+      </div>
+    </section>
+
+    <footer>
+      <p>Served on 127.0.0.1. The scan runs from this computer, using the same engine as <code>scanner.py</code>.</p>
+    </footer>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
