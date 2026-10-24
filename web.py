@@ -9,6 +9,7 @@ open it can start a scan from this machine.
 """
 
 import argparse
+import ipaddress
 import json
 import socket
 import threading
@@ -18,7 +19,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from scanner import SERVICES, parse_ports, scan_host
+from scanner import (
+    SERVICES,
+    compute_risk_summary,
+    parse_ports,
+    parse_targets,
+    scan_all_targets,
+    scan_host,
+)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 HOST = "127.0.0.1"
@@ -84,24 +92,30 @@ def get_job(scan_id):
         return JOBS.get(scan_id)
 
 
-def run_job(job, ports, timeout, threads):
+def run_job(job, targets, ports, timeout, threads):
     started = time.time()
     open_count = 0
     checked = 0
     last_emit = 0.0
+    all_hits = []
 
     def on_result(done, total, result):
         nonlocal open_count, checked, last_emit
         checked = done
         hit = None
         if result:
-            port, banner = result
             open_count += 1
             hit = {
-                "port": port,
-                "service": SERVICES.get(port, "unknown"),
-                "banner": banner,
+                "host": result["host"],
+                "ip": result["ip"],
+                "port": result["port"],
+                "service": result["service"],
+                "banner": result["banner"],
+                "risk": result["risk"],
+                "score": result["score"],
+                "recommendation": result["recommendation"],
             }
+            all_hits.append(hit)
         now = time.monotonic()
         if hit is None and done != total and now - last_emit < 0.08:
             return
@@ -116,20 +130,28 @@ def run_job(job, ports, timeout, threads):
         job.publish("progress", payload)
         last_emit = now
 
-    print(f"Scanning {job.host} ({job.ip}), {len(ports)} ports", flush=True)
-    job.publish("started", {"host": job.host, "ip": job.ip, "total": len(ports)})
+    total_checks = len(targets) * len(ports)
+    print(f"Scanning {job.host} ({job.ip}), {total_checks} total checks", flush=True)
+    job.publish("started", {
+        "host": job.host,
+        "ip": job.ip,
+        "total": total_checks,
+        "hosts_count": len(targets),
+    })
     try:
-        scan_host(
-            job.ip, ports, timeout, threads,
+        scan_all_targets(
+            targets, ports, timeout, threads,
             on_result=on_result, cancel_event=job.cancel_event,
         )
         elapsed = round(time.time() - started, 2)
+        risk_summary = compute_risk_summary(all_hits)
         job.publish("finished", {
             "open": open_count,
             "checked": checked,
-            "total": len(ports),
+            "total": total_checks,
             "elapsed": elapsed,
             "cancelled": job.cancel_event.is_set(),
+            "risk_summary": risk_summary,
         })
         label = "Stopped" if job.cancel_event.is_set() else "Finished"
         print(f"{label} {job.host}: {open_count} open in {elapsed:.1f}s", flush=True)
@@ -140,9 +162,10 @@ def run_job(job, ports, timeout, threads):
         job.finish()
 
 
-def launch_scan(host, ip, ports, timeout, threads):
+def launch_scan(host, ip, targets, ports, timeout, threads):
     """Start a scan unless one is already running. Reserves the slot under the lock."""
-    job = Job(host, ip, len(ports))
+    total_checks = len(targets) * len(ports)
+    job = Job(host, ip, total_checks)
     with STATE:
         if any(not item.finished for item in JOBS.values()):
             return None
@@ -153,7 +176,7 @@ def launch_scan(host, ip, ports, timeout, threads):
             if dropped != job.id:
                 JOBS.pop(dropped, None)
     threading.Thread(
-        target=run_job, args=(job, list(ports), timeout, threads), daemon=True,
+        target=run_job, args=(job, targets, list(ports), timeout, threads), daemon=True,
     ).start()
     return job
 
@@ -168,9 +191,16 @@ def validate(data):
         return "Enter a hostname or IP address"
     host = host.strip()
     if not host or len(host) > 253 or any(ch.isspace() for ch in host):
-        return "Enter a hostname or IP address"
-    if "://" in host or "/" in host:
+        return "Enter a hostname, IP address, or CIDR range"
+    if "://" in host:
         return "Enter a hostname or IP address, not a URL"
+    if "/" in host:
+        try:
+            net = ipaddress.ip_network(host, strict=False)
+            if net.num_addresses > 1024:
+                return f"Subnet too large ({net.num_addresses} addresses). Maximum allowed is 1024."
+        except ValueError:
+            return "Enter a valid CIDR notation (e.g. 192.168.1.0/24)"
 
     ports_text = data.get("ports", "1-1024")
     if not isinstance(ports_text, str):
@@ -201,7 +231,7 @@ def validate(data):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "PortScanner/1.0"
+    server_version = "PortScanner/2.0"
 
     def log_message(self, fmt, *args):
         path = urlparse(self.path).path
@@ -294,19 +324,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         host, ports, threads, timeout = result
         try:
-            ip = socket.gethostbyname(host)
-        except socket.gaierror:
-            self.send_json(400, {"error": f"Could not resolve {host}"})
+            targets = parse_targets(host)
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
             return
-        job = launch_scan(host, ip, ports, timeout, threads)
+
+        display_ip = targets[0][1] if len(targets) == 1 else f"{len(targets)} hosts ({host})"
+        total_checks = len(targets) * len(ports)
+        job = launch_scan(host, display_ip, targets, ports, timeout, threads)
         if job is None:
             self.send_json(409, {"error": "A scan is already running"})
             return
         self.send_json(200, {
             "id": job.id,
             "host": host,
-            "ip": ip,
-            "total": len(ports),
+            "ip": display_ip,
+            "total": total_checks,
+            "hosts_count": len(targets),
         })
 
     def serve_events(self, scan_id):
@@ -326,7 +360,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"events": events, "next": nxt, "done": done})
 
     def cancel_scan(self, scan_id):
-        # sendBeacon posts a body. Read it so the connection stays in sync.
         if self.read_body() is None:
             return
         job = get_job(scan_id)

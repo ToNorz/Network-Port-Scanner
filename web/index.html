@@ -13,17 +13,17 @@
         <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
         <div>
           <h1>Port Scanner</h1>
-          <p>TCP connect scan with banner grabbing</p>
+          <p>TCP connect scan with risk assessment and banner grabbing</p>
         </div>
       </div>
-      <p class="pill">This machine only</p>
+      <p class="pill">Security Auditor</p>
     </header>
 
     <form id="scan-form" class="panel">
       <div class="target-row">
         <label class="field grow">
-          <span>Target</span>
-          <input id="host" name="host" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false" placeholder="hostname or IP" required>
+          <span>Target (IP, Hostname, or CIDR)</span>
+          <input id="host" name="host" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false" placeholder="e.g. 127.0.0.1, scanme.nmap.org, or 192.168.1.0/24" required>
         </label>
         <button id="scan" class="scan-btn" type="submit">Scan</button>
       </div>
@@ -36,6 +36,7 @@
       <div class="presets" role="group" aria-label="Port presets">
         <button type="button" data-preset="common">Common</button>
         <button type="button" data-preset="wellknown" aria-pressed="true">Well-known</button>
+        <button type="button" data-preset="sensitive">Sensitive Ports</button>
         <button type="button" data-preset="all">All ports</button>
         <p id="port-count" class="count">1,024 ports</p>
       </div>
@@ -51,7 +52,7 @@
         </label>
       </div>
 
-      <p class="note">Only scan machines you own or have permission to test. A filtered port waits for the full timeout.</p>
+      <p class="note">Only scan targets you own or have authorization to assess. Supports subnets up to /24 (256 hosts).</p>
       <p id="error" class="error" role="alert" hidden></p>
     </form>
 
@@ -59,10 +60,11 @@
       <div class="results-head">
         <div>
           <h2 id="status">No scan yet</h2>
-          <p id="detail">Open ports show up here as the scan finds them.</p>
+          <p id="detail">Open ports and security findings show up here in real time.</p>
         </div>
         <div class="results-actions">
           <button type="button" id="copy" disabled>Copy</button>
+          <button type="button" id="json" disabled>Download JSON</button>
           <button type="button" id="csv" disabled>Download CSV</button>
         </div>
       </div>
@@ -71,10 +73,25 @@
         <span id="bar"></span>
       </div>
 
+      <!-- Risk Summary Banner -->
+      <div id="risk-card" class="risk-card" hidden>
+        <div class="risk-level-badge">
+          <span>Overall Risk:</span>
+          <span id="risk-badge" class="badge badge-info">INFO</span>
+          <span id="risk-score" style="color: var(--muted); font-size: 0.8rem; font-weight: normal;">(Score: 0.0/10)</span>
+        </div>
+        <div class="risk-breakdown" id="risk-breakdown">
+          <span class="breakdown-pill" id="pill-critical">0 Critical</span>
+          <span class="breakdown-pill" id="pill-high">0 High</span>
+          <span class="breakdown-pill" id="pill-medium">0 Medium</span>
+          <span class="breakdown-pill" id="pill-low">0 Low</span>
+        </div>
+      </div>
+
       <div class="table-tools">
         <label class="filter-label">
           <span class="sr-only">Filter open ports</span>
-          <input id="filter" type="search" placeholder="Filter by port, service, or banner" disabled>
+          <input id="filter" type="search" placeholder="Filter by port, host, service, or risk..." disabled>
         </label>
       </div>
 
@@ -82,8 +99,10 @@
         <table>
           <thead>
             <tr>
+              <th scope="col" id="col-host" hidden>Host</th>
               <th scope="col">Port</th>
               <th scope="col">Service</th>
+              <th scope="col">Risk</th>
               <th scope="col">Banner</th>
             </tr>
           </thead>
@@ -91,10 +110,16 @@
         </table>
         <p id="empty" class="empty">Nothing scanned yet.</p>
       </div>
+
+      <!-- Security Recommendations Section -->
+      <div id="recommendations-box" class="recommendations-box" hidden>
+        <h3>Security Recommendations & Advisories</h3>
+        <div id="recommendations-list"></div>
+      </div>
     </section>
 
     <footer>
-      <p>Served on 127.0.0.1. The scan runs from this computer, using the same engine as <code>scanner.py</code>.</p>
+      <p>Local Security Auditor. The scan runs from this computer using the updated <code>scanner.py</code> engine with CIDR support and automated risk scoring.</p>
     </footer>
   </div>
   <script src="/app.js"></script>
