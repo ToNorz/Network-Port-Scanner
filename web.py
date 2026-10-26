@@ -27,6 +27,7 @@ from scanner import (
     scan_all_targets,
     scan_host,
 )
+from stealth import mode_label, normalize_mode, stealth_available
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 HOST = "127.0.0.1"
@@ -92,7 +93,7 @@ def get_job(scan_id):
         return JOBS.get(scan_id)
 
 
-def run_job(job, targets, ports, timeout, threads):
+def run_job(job, targets, ports, timeout, threads, mode):
     started = time.time()
     open_count = 0
     checked = 0
@@ -131,17 +132,21 @@ def run_job(job, targets, ports, timeout, threads):
         last_emit = now
 
     total_checks = len(targets) * len(ports)
-    print(f"Scanning {job.host} ({job.ip}), {total_checks} total checks", flush=True)
+    print(
+        f"Scanning {job.host} ({job.ip}), {total_checks} total checks, {mode_label(mode)}",
+        flush=True,
+    )
     job.publish("started", {
         "host": job.host,
         "ip": job.ip,
         "total": total_checks,
         "hosts_count": len(targets),
+        "mode": mode,
     })
     try:
         scan_all_targets(
             targets, ports, timeout, threads,
-            on_result=on_result, cancel_event=job.cancel_event,
+            on_result=on_result, cancel_event=job.cancel_event, mode=mode,
         )
         elapsed = round(time.time() - started, 2)
         risk_summary = compute_risk_summary(all_hits)
@@ -152,6 +157,7 @@ def run_job(job, targets, ports, timeout, threads):
             "elapsed": elapsed,
             "cancelled": job.cancel_event.is_set(),
             "risk_summary": risk_summary,
+            "mode": mode,
         })
         label = "Stopped" if job.cancel_event.is_set() else "Finished"
         print(f"{label} {job.host}: {open_count} open in {elapsed:.1f}s", flush=True)
@@ -162,7 +168,7 @@ def run_job(job, targets, ports, timeout, threads):
         job.finish()
 
 
-def launch_scan(host, ip, targets, ports, timeout, threads):
+def launch_scan(host, ip, targets, ports, timeout, threads, mode):
     """Start a scan unless one is already running. Reserves the slot under the lock."""
     total_checks = len(targets) * len(ports)
     job = Job(host, ip, total_checks)
@@ -176,13 +182,13 @@ def launch_scan(host, ip, targets, ports, timeout, threads):
             if dropped != job.id:
                 JOBS.pop(dropped, None)
     threading.Thread(
-        target=run_job, args=(job, targets, list(ports), timeout, threads), daemon=True,
+        target=run_job, args=(job, targets, list(ports), timeout, threads, mode), daemon=True,
     ).start()
     return job
 
 
 def validate(data):
-    """Return (host, ports, threads, timeout) or an error string."""
+    """Return (host, ports, threads, timeout, mode) or an error string."""
     if not isinstance(data, dict):
         return "Expected a JSON object"
 
@@ -226,7 +232,16 @@ def validate(data):
     if not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
         return f"Timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds"
 
-    return host, ports, threads, timeout
+    try:
+        mode = normalize_mode(data.get("mode", "connect"))
+    except ValueError as exc:
+        return str(exc)
+    if mode == "stealth":
+        ready, reason = stealth_available()
+        if not ready:
+            return reason
+
+    return host, ports, threads, timeout, mode
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -243,6 +258,14 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in STATIC:
             self.serve_static(*STATIC[path])
+            return
+        if path == "/api/capabilities":
+            ready, reason = stealth_available()
+            self.send_json(200, {
+                "stealth": ready,
+                "stealth_reason": "" if ready else reason,
+                "modes": ["connect", "stealth"],
+            })
             return
         if path.startswith("/api/scans/"):
             scan_id = path.removeprefix("/api/scans/").strip("/")
@@ -322,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(result, str):
             self.send_json(400, {"error": result})
             return
-        host, ports, threads, timeout = result
+        host, ports, threads, timeout, mode = result
         try:
             targets = parse_targets(host)
         except ValueError as exc:
@@ -331,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
 
         display_ip = targets[0][1] if len(targets) == 1 else f"{len(targets)} hosts ({host})"
         total_checks = len(targets) * len(ports)
-        job = launch_scan(host, display_ip, targets, ports, timeout, threads)
+        job = launch_scan(host, display_ip, targets, ports, timeout, threads, mode)
         if job is None:
             self.send_json(409, {"error": "A scan is already running"})
             return
@@ -341,6 +364,7 @@ class Handler(BaseHTTPRequestHandler):
             "ip": display_ip,
             "total": total_checks,
             "hosts_count": len(targets),
+            "mode": mode,
         })
 
     def serve_events(self, scan_id):
