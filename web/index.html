@@ -13,7 +13,7 @@
         <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
         <div>
           <h1>Port Scanner</h1>
-          <p>TCP connect scan with risk assessment and banner grabbing</p>
+          <p>TCP scan with a full handshake or a stealth SYN probe</p>
         </div>
       </div>
       <p class="pill">Security Auditor</p>
@@ -40,6 +40,23 @@
         <button type="button" data-preset="all">All ports</button>
         <p id="port-count" class="count">1,024 ports</p>
       </div>
+
+      <fieldset class="mode" id="mode">
+        <legend>Scan mode</legend>
+        <div class="mode-options">
+          <label class="mode-option">
+            <input type="radio" name="mode" value="connect" checked>
+            <span class="mode-name">Normal</span>
+            <span class="mode-desc">Three-way handshake</span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="mode" value="stealth">
+            <span class="mode-name">Stealth</span>
+            <span class="mode-desc">SYN probe</span>
+          </label>
+        </div>
+        <p id="mode-hint" class="mode-hint">Opens a full TCP connection and reads a short banner.</p>
+      </fieldset>
 
       <div class="controls">
         <label class="field">
@@ -119,7 +136,7 @@
     </section>
 
     <footer>
-      <p>Local Security Auditor. The scan runs from this computer using the updated <code>scanner.py</code> engine with CIDR support and automated risk scoring.</p>
+      <p>Local Security Auditor. Choose a normal three-way handshake or a stealth SYN scan. The scan runs on this computer.</p>
     </footer>
   </div>
   <script src="/app.js"></script>

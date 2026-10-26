@@ -26,6 +26,9 @@ const copyBtn = document.querySelector("#copy");
 const jsonBtn = document.querySelector("#json");
 const csvBtn = document.querySelector("#csv");
 const countEl = document.querySelector("#port-count");
+const modeField = document.querySelector("#mode");
+const modeInputs = [...document.querySelectorAll('input[name="mode"]')];
+const modeHint = document.querySelector("#mode-hint");
 const colHost = document.querySelector("#col-host");
 const riskCard = document.querySelector("#risk-card");
 const riskBadge = document.querySelector("#risk-badge");
@@ -50,7 +53,10 @@ const state = {
   open: 0,
   elapsed: 0,
   isMultiHost: false,
+  mode: "connect",
 };
+
+let stealthReason = "";
 
 function parseBound(text) {
   const trimmed = text.trim();
@@ -109,11 +115,29 @@ function showError(message) {
   errorEl.textContent = message;
 }
 
+function selectedMode() {
+  const picked = modeInputs.find((input) => input.checked);
+  return picked && picked.value === "stealth" ? "stealth" : "connect";
+}
+
+function updateModeHint() {
+  const stealth = selectedMode() === "stealth";
+  if (stealth && stealthReason) {
+    modeHint.textContent = stealthReason;
+  } else if (stealth) {
+    modeHint.textContent = "Sends a SYN and answers with RST, so the handshake never completes. Banners are skipped.";
+  } else {
+    modeHint.textContent = "Opens a full TCP connection and reads a short banner.";
+  }
+  modeHint.classList.toggle("warn", stealth && Boolean(stealthReason));
+}
+
 function setLocked(locked) {
   hostEl.readOnly = locked;
   portsEl.readOnly = locked;
   threadsEl.readOnly = locked;
   timeoutEl.readOnly = locked;
+  modeField.disabled = locked;
   for (const button of presetButtons) button.disabled = locked;
 }
 
@@ -139,6 +163,7 @@ function savePrefs() {
       ports: portsEl.value,
       threads: threadsEl.value,
       timeout: timeoutEl.value,
+      mode: selectedMode(),
     }));
   } catch {
     // Storage access might be restricted in some browser modes
@@ -153,6 +178,9 @@ function loadPrefs() {
     if (typeof saved.ports === "string" && saved.ports) portsEl.value = saved.ports;
     if (saved.threads) threadsEl.value = saved.threads;
     if (saved.timeout) timeoutEl.value = saved.timeout;
+    if (saved.mode === "stealth" || saved.mode === "connect") {
+      for (const input of modeInputs) input.checked = input.value === saved.mode;
+    }
   } catch {
     // Keep defaults on failure
   }
@@ -335,11 +363,15 @@ function renderRows() {
   renderRiskAndRecommendations();
 }
 
+function modeText() {
+  return state.mode === "stealth" ? "stealth SYN" : "full handshake";
+}
+
 function renderStatus() {
   const host = state.host ? `${state.host} (${state.ip})` : "";
   if (state.running) {
     statusEl.textContent = "Scanning";
-    detailEl.textContent = `${host} · ${state.checked.toLocaleString()} / ${state.total.toLocaleString()} checked · ${state.open.toLocaleString()} open · ${formatElapsed(state.elapsed)}`;
+    detailEl.textContent = `${host} · ${modeText()} · ${state.checked.toLocaleString()} / ${state.total.toLocaleString()} checked · ${state.open.toLocaleString()} open · ${formatElapsed(state.elapsed)}`;
     document.title = `${Math.floor(state.total ? (state.checked / state.total) * 100 : 0)}% · Port Scanner`;
   }
   const fraction = state.total ? Math.min(100, (state.checked / state.total) * 100) : 0;
@@ -351,10 +383,11 @@ function renderStatus() {
   filterEl.disabled = !hasRows;
 }
 
-function resetResults(host, ip, total, isMultiHost) {
+function resetResults(host, ip, total, isMultiHost, mode) {
   state.rows = [];
   state.host = host;
   state.ip = ip;
+  state.mode = mode === "stealth" ? "stealth" : "connect";
   state.total = total;
   state.checked = 0;
   state.open = 0;
@@ -382,14 +415,14 @@ function finishScan(data) {
   const host = `${state.host} (${state.ip})`;
   if (data.cancelled) {
     statusEl.textContent = "Stopped";
-    detailEl.textContent = `${host} · ${state.open.toLocaleString()} open · ${state.checked.toLocaleString()} of ${state.total.toLocaleString()} checked · ${formatElapsed(state.elapsed)}`;
+    detailEl.textContent = `${host} · ${modeText()} · ${state.open.toLocaleString()} open · ${state.checked.toLocaleString()} of ${state.total.toLocaleString()} checked · ${formatElapsed(state.elapsed)}`;
   } else {
     statusEl.textContent = state.open === 0
       ? "No open ports"
       : state.open === 1
         ? "1 open port"
         : `${state.open.toLocaleString()} open ports`;
-    detailEl.textContent = `${host} · finished in ${formatElapsed(state.elapsed)}`;
+    detailEl.textContent = `${host} · ${modeText()} · finished in ${formatElapsed(state.elapsed)}`;
     state.checked = state.total;
   }
   document.title = "Port Scanner";
@@ -454,6 +487,7 @@ function applyEvent(event) {
     state.ip = data.ip || state.ip;
     state.total = data.total || state.total;
     state.isMultiHost = (data.hosts_count || 1) > 1;
+    if (data.mode === "stealth" || data.mode === "connect") state.mode = data.mode;
     renderStatus();
     return;
   }
@@ -493,6 +527,7 @@ async function startScan() {
     showError("No valid ports in that range.");
     return;
   }
+  const mode = selectedMode();
   state.running = true;
   state.generation += 1;
   const generation = state.generation;
@@ -514,6 +549,7 @@ async function startScan() {
         ports: portsEl.value.trim(),
         threads: Number(threadsEl.value),
         timeout: Number(timeoutEl.value),
+        mode,
       }),
     });
   } catch {
@@ -535,7 +571,7 @@ async function startScan() {
 
   state.id = payload.id;
   const isMulti = (payload.hosts_count || 1) > 1;
-  resetResults(payload.host, payload.ip, payload.total, isMulti);
+  resetResults(payload.host, payload.ip, payload.total, isMulti, payload.mode || mode);
   scanBtn.disabled = false;
   scanBtn.classList.add("stop");
   scanBtn.textContent = "Stop";
@@ -564,6 +600,10 @@ portsEl.addEventListener("input", () => {
   updatePortCount();
   updatePresetPress();
 });
+
+for (const input of modeInputs) {
+  input.addEventListener("change", updateModeHint);
+}
 
 for (const button of presetButtons) {
   button.addEventListener("click", () => {
@@ -596,6 +636,7 @@ jsonBtn.addEventListener("click", () => {
   const report = {
     scanner: "Network Port Scanner",
     version: "2.0",
+    scan_mode: state.mode,
     target: state.host,
     ip: state.ip,
     timestamp: new Date().toISOString(),
@@ -645,6 +686,20 @@ window.addEventListener("pagehide", () => {
   }
 });
 
+async function loadCapabilities() {
+  try {
+    const response = await fetch("/api/capabilities");
+    if (!response.ok) return;
+    const body = await response.json();
+    stealthReason = body.stealth ? "" : (body.stealth_reason || "Stealth mode needs root.");
+  } catch {
+    stealthReason = "";
+  }
+  updateModeHint();
+}
+
 loadPrefs();
 updatePortCount();
 updatePresetPress();
+updateModeHint();
+loadCapabilities();

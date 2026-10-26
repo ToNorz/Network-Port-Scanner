@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Multithreaded TCP port scanner with banner grabbing, risk scoring, and reporting.
 
-Only scan machines you own or have written permission to test.
+A scan is either a normal three-way handshake or a stealth SYN probe.
+Stealth mode needs root. Only scan machines you own or have written
+permission to test.
 
 Examples:
     python3 scanner.py 127.0.0.1
     python3 scanner.py 192.168.1.10 -p 1-1024
     python3 scanner.py 192.168.1.0/28 -p 22,80,443 -o results.json
     python3 scanner.py scanme.nmap.org -p 21,22,23,80,443 -o report.csv
+    sudo python3 scanner.py 127.0.0.1 --mode stealth -p 22,80,443
 
 Web interface:
     python3 web.py
@@ -24,6 +27,15 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+from stealth import (
+    MODE_STEALTH,
+    StealthError,
+    mode_label,
+    normalize_mode,
+    open_engine,
+    stealth_available,
+)
 
 # Known sensitive ports mapped to security severity, risk score (0-10), and actionable remediation
 PORT_SECURITY = {
@@ -347,9 +359,20 @@ def parse_targets(target_spec):
         raise ValueError(f"Could not resolve host '{target_spec}'")
 
 
-def scan_port(host, port, timeout, cancel_event=None):
-    """Return (port, banner) if the port is open, otherwise None."""
+def scan_port(host, port, timeout, cancel_event=None, mode="connect", engine=None):
+    """Return (port, banner) if the port is open, otherwise None.
+
+    Connect mode finishes the TCP handshake and reads a short banner.
+    Stealth mode sends SYN and leaves the handshake unfinished, so the
+    banner is empty. Pass the engine from scan_host or scan_all_targets.
+    """
     if cancel_event is not None and cancel_event.is_set():
+        return None
+    if normalize_mode(mode) == MODE_STEALTH:
+        if engine is None:
+            raise StealthError("Use scan_host or scan_all_targets for stealth mode.")
+        if engine.probe(host, port, timeout, cancel_event):
+            return port, ""
         return None
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -367,11 +390,11 @@ def scan_port(host, port, timeout, cancel_event=None):
         return None
 
 
-def scan_target_port(host, ip, port, timeout, cancel_event=None):
+def scan_target_port(host, ip, port, timeout, cancel_event=None, mode="connect", engine=None):
     """Worker task returning enriched result dictionary if port is open."""
     if cancel_event is not None and cancel_event.is_set():
         return None
-    res = scan_port(ip, port, timeout, cancel_event)
+    res = scan_port(ip, port, timeout, cancel_event, mode, engine)
     if res:
         port_num, banner = res
         sec = assess_port(port_num)
@@ -388,10 +411,11 @@ def scan_target_port(host, ip, port, timeout, cancel_event=None):
     return None
 
 
-def scan_host(ip, ports, timeout, threads, on_result=None, cancel_event=None):
+def scan_host(ip, ports, timeout, threads, on_result=None, cancel_event=None, mode="connect"):
     """Scan TCP ports on a single IP address (backwards compatible).
 
     Returns list of (port, banner) tuples for open ports.
+    mode is 'connect' (three-way handshake) or 'stealth' (SYN only).
     """
     if threads < 1:
         raise ValueError("threads must be at least 1")
@@ -405,35 +429,44 @@ def scan_host(ip, ports, timeout, threads, on_result=None, cancel_event=None):
     pool = ThreadPoolExecutor(max_workers=min(threads, total))
     cancelled = False
     try:
-        pending = {pool.submit(scan_port, ip, port, timeout, cancel_event) for port in ports}
-        while pending:
-            try:
-                done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
-            except KeyboardInterrupt:
-                cancelled = True
-                if cancel_event is not None:
-                    cancel_event.set()
-                for fut in pending:
-                    fut.cancel()
+        with open_engine(mode) as (mode, engine):
+            pending = {
+                pool.submit(scan_port, ip, port, timeout, cancel_event, mode, engine)
+                for port in ports
+            }
+            while pending:
                 try:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    pool.shutdown(wait=False)
-                raise
+                    done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
+                except KeyboardInterrupt:
+                    cancelled = True
+                    if cancel_event is not None:
+                        cancel_event.set()
+                    for fut in pending:
+                        fut.cancel()
+                    try:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        pool.shutdown(wait=False)
+                    raise
 
-            for fut in done:
-                checked += 1
-                try:
-                    result = fut.result()
-                except Exception:
-                    result = None
-                if result:
-                    open_ports.append(result)
-                if on_result:
-                    on_result(checked, total, result)
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
+                for fut in done:
+                    checked += 1
+                    try:
+                        result = fut.result()
+                    except StealthError:
+                        cancelled = True
+                        if cancel_event is not None:
+                            cancel_event.set()
+                        raise
+                    except Exception:
+                        result = None
+                    if result:
+                        open_ports.append(result)
+                    if on_result:
+                        on_result(checked, total, result)
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
     finally:
         try:
             pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
@@ -444,8 +477,11 @@ def scan_host(ip, ports, timeout, threads, on_result=None, cancel_event=None):
     return open_ports
 
 
-def scan_all_targets(targets, ports, timeout, threads, on_result=None, cancel_event=None):
-    """Scan ports across multiple (host, ip) targets with full risk enrichment."""
+def scan_all_targets(targets, ports, timeout, threads, on_result=None, cancel_event=None, mode="connect"):
+    """Scan ports across multiple (host, ip) targets with full risk enrichment.
+
+    mode is 'connect' for a full three-way handshake, or 'stealth' for SYN only.
+    """
     if threads < 1:
         raise ValueError("threads must be at least 1")
 
@@ -459,38 +495,46 @@ def scan_all_targets(targets, ports, timeout, threads, on_result=None, cancel_ev
     pool = ThreadPoolExecutor(max_workers=min(threads, total))
     cancelled = False
     try:
-        pending = {
-            pool.submit(scan_target_port, host, ip, port, timeout, cancel_event)
-            for host, ip, port in tasks
-        }
-        while pending:
-            try:
-                done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
-            except KeyboardInterrupt:
-                cancelled = True
-                if cancel_event is not None:
-                    cancel_event.set()
-                for fut in pending:
-                    fut.cancel()
+        with open_engine(mode) as (mode, engine):
+            pending = {
+                pool.submit(
+                    scan_target_port, host, ip, port, timeout, cancel_event, mode, engine
+                )
+                for host, ip, port in tasks
+            }
+            while pending:
                 try:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    pool.shutdown(wait=False)
-                raise
+                    done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
+                except KeyboardInterrupt:
+                    cancelled = True
+                    if cancel_event is not None:
+                        cancel_event.set()
+                    for fut in pending:
+                        fut.cancel()
+                    try:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        pool.shutdown(wait=False)
+                    raise
 
-            for fut in done:
-                checked += 1
-                try:
-                    res = fut.result()
-                except Exception:
-                    res = None
-                if res:
-                    results.append(res)
-                if on_result:
-                    on_result(checked, total, res)
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
+                for fut in done:
+                    checked += 1
+                    try:
+                        res = fut.result()
+                    except StealthError:
+                        cancelled = True
+                        if cancel_event is not None:
+                            cancel_event.set()
+                        raise
+                    except Exception:
+                        res = None
+                    if res:
+                        results.append(res)
+                    if on_result:
+                        on_result(checked, total, res)
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
     finally:
         try:
             pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
@@ -614,6 +658,9 @@ def main():
                         help="number of worker threads (default 100)")
     parser.add_argument("--timeout", type=float, default=0.5,
                         help="seconds to wait per port (default 0.5)")
+    parser.add_argument("--mode", choices=("connect", "stealth"), default="connect",
+                        help="connect completes the TCP three-way handshake (default); "
+                             "stealth sends SYN and does not finish the handshake (needs root)")
     parser.add_argument("-o", "--output", default=None,
                         help="save scan report to disk (supports .json or .csv)")
     parser.add_argument("-f", "--format", choices=["auto", "json", "csv"], default="auto",
@@ -641,15 +688,30 @@ def main():
 
     is_multi_host = len(targets) > 1
     total_checks = len(targets) * len(ports)
+    try:
+        scan_mode = normalize_mode(args.mode)
+    except ValueError as exc:
+        print(colorize(str(exc), Colors.RED, use_color))
+        sys.exit(1)
+    if scan_mode == MODE_STEALTH:
+        ready, reason = stealth_available()
+        if not ready:
+            print(colorize(reason, Colors.RED, use_color))
+            sys.exit(1)
+    how = mode_label(scan_mode)
 
     if is_multi_host:
         print(colorize(
-            f"Scanning subnet {args.host} ({len(targets)} hosts, {len(ports)} ports each, {total_checks} total checks)...",
+            f"Scanning subnet {args.host} ({len(targets)} hosts, {len(ports)} ports each, "
+            f"{total_checks} total checks, {how})...",
             Colors.BOLD, use_color
         ))
     else:
         label, ip = targets[0]
-        print(colorize(f"Scanning {label} ({ip}), {len(ports)} ports...", Colors.BOLD, use_color))
+        print(colorize(
+            f"Scanning {label} ({ip}), {len(ports)} ports, {how}...",
+            Colors.BOLD, use_color
+        ))
 
     cancel_event = threading.Event()
     interrupted = False
@@ -659,8 +721,11 @@ def main():
     try:
         open_results = scan_all_targets(
             targets, ports, args.timeout, args.threads,
-            cancel_event=cancel_event
+            cancel_event=cancel_event, mode=scan_mode,
         )
+    except StealthError as exc:
+        print(colorize(str(exc), Colors.RED, use_color))
+        sys.exit(1)
     except KeyboardInterrupt:
         interrupted = True
         cancel_event.set()
@@ -715,6 +780,7 @@ def main():
     # Assessment summary
     status_label = "Interrupted" if interrupted else "Completed"
     print(colorize(f"Scan Status: {status_label}", Colors.BOLD, use_color))
+    print(f"Mode: {how}")
     print(f"Elapsed Time: {elapsed:.2f}s | Open Ports: {len(open_results)} found across {len(targets)} host(s)")
 
     if open_results:
@@ -735,6 +801,7 @@ def main():
         scan_meta = {
             "scanner": "Network Port Scanner",
             "version": "2.0",
+            "scan_mode": scan_mode,
             "target": args.host,
             "hosts_count": len(targets),
             "ports_scanned_count": len(ports),
