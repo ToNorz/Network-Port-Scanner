@@ -22,7 +22,9 @@ import datetime
 import ipaddress
 import json
 import os
+import re
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -268,8 +270,317 @@ def colorize(text, color, enabled=True):
     return f"{color}{text}{Colors.RESET}"
 
 
+# ---------------------------------------------------------------------------
+# Dynamic risk analysis engine
+# ---------------------------------------------------------------------------
+
+# Known-vulnerable version patterns: list of (compiled_regex, score_penalty, note)
+# The regex is matched against the raw banner (case-insensitive).
+# Penalties are *added* on top of the port's base score (capped at 10.0).
+_VULN_PATTERNS = [
+    # OpenSSH – old versions
+    (re.compile(r"openssh[_\s-]+(\d+)\.(\d+)", re.I), None,
+     "OpenSSH version detected — checking age"),
+    # Apache httpd
+    (re.compile(r"apache/(\d+)\.(\d+)\.(\d+)", re.I), None,
+     "Apache version detected"),
+    # nginx
+    (re.compile(r"nginx/(\d+)\.(\d+)\.(\d+)", re.I), None,
+     "nginx version detected"),
+    # ProFTPD
+    (re.compile(r"proftpd[^\d]*(\d+)\.(\d+)\.(\d+)", re.I), None,
+     "ProFTPD version detected"),
+    # vsftpd 2.3.4 (backdoor)
+    (re.compile(r"vsftpd\s*2\.3\.4", re.I), 2.5,
+     "vsftpd 2.3.4 detected — contains a well-known backdoor (CVE-2011-2523)"),
+    # vsftpd any version
+    (re.compile(r"vsftpd[^\d]*(\d+)\.(\d+)", re.I), None,
+     "vsftpd version detected"),
+    # Microsoft IIS
+    (re.compile(r"microsoft-iis/(\d+)\.(\d+)", re.I), None,
+     "IIS version detected"),
+    # Exim
+    (re.compile(r"exim\s+(\d+)\.(\d+)", re.I), None,
+     "Exim SMTP version detected"),
+    # Postfix
+    (re.compile(r"postfix", re.I), 0.0,
+     "Postfix SMTP detected"),
+    # Anonymous FTP hints
+    (re.compile(r"anonymous", re.I), 1.5,
+     "Anonymous FTP access appears enabled — unauthenticated file access possible"),
+    # Telnet cleartext warnings
+    (re.compile(r"telnet", re.I), 1.0,
+     "Telnet session data is transmitted in cleartext"),
+    # Redis without auth
+    (re.compile(r"\+PONG", re.I), 2.0,
+     "Redis responded to PING without authentication — unauthenticated access confirmed"),
+    # MongoDB without auth
+    (re.compile(r"mongodb", re.I), 1.0,
+     "MongoDB banner detected"),
+    # Elasticsearch
+    (re.compile(r'"cluster_name"|"tagline"\s*:', re.I), 1.5,
+     "Elasticsearch API responded without authentication"),
+    # SMB / NetBIOS
+    (re.compile(r"smb|cifs", re.I), 1.5,
+     "SMB/CIFS service confirmed — keep patched against EternalBlue-class exploits"),
+    # Docker API
+    (re.compile(r'"ApiVersion"|docker.*api', re.I), 2.5,
+     "Docker Remote API detected — unauthenticated container/host control possible"),
+    # VNC
+    (re.compile(r"RFB \d+\.\d+", re.I), 1.0,
+     "VNC RFB protocol confirmed — verify strong password and tunnel via SSH"),
+    # RDP/NTLM
+    (re.compile(r"NTLMSSP|rdp", re.I), 0.5,
+     "RDP/NTLM handshake detected"),
+    # SSL/TLS version weak hints (caught separately by TLS probe)
+    (re.compile(r"SSLv2|SSLv3", re.I), 2.0,
+     "Obsolete SSL version advertised — vulnerable to POODLE/DROWN attacks"),
+]
+
+# Version cut-offs: service → (major, minor) below which score is raised
+_OLD_VERSION_PENALTIES = {
+    "openssh": ((7, 4), 1.5, "OpenSSH < 7.4 has known vulnerabilities; upgrade to latest"),
+    "apache":  ((2, 4), 2.0, "Apache < 2.4 is EOL with many unpatched CVEs; upgrade immediately"),
+    "nginx":   ((1, 18), 1.0, "nginx < 1.18 may be missing security patches; upgrade"),
+    "iis":     ((10, 0), 1.5, "IIS < 10 is outdated and may lack security features"),
+    "exim":    ((4, 94), 1.5, "Exim < 4.94 has critical RCE vulnerabilities (21Nails)"),
+    "proftpd": ((1, 3), 1.0, "ProFTPD < 1.3 has known remote code execution paths"),
+    "vsftpd":  ((3, 0), 0.5, "vsftpd < 3.0 is outdated; consider upgrading"),
+}
+
+# Protocol-specific probe payloads: port → bytes to send (or None for banner-only)
+_PROBES = {
+    21:    b"",                                    # FTP sends banner on connect
+    22:    b"",                                    # SSH sends banner on connect
+    23:    b"",                                    # Telnet sends banner on connect
+    25:    b"EHLO probe\r\n",                      # SMTP
+    80:    b"HEAD / HTTP/1.0\r\nHost: probe\r\n\r\n",
+    110:   b"",                                    # POP3 sends banner
+    143:   b"",                                    # IMAP sends banner
+    443:   None,                                   # TLS-wrapped; special handling
+    587:   b"EHLO probe\r\n",
+    993:   None,                                   # IMAPS – TLS
+    995:   None,                                   # POP3S – TLS
+    1433:  b"",
+    3306:  b"",                                    # MySQL sends handshake
+    3389:  b"",                                    # RDP
+    5432:  b"",
+    5900:  b"",                                    # VNC sends RFB banner
+    6379:  b"PING\r\n",                            # Redis
+    8080:  b"HEAD / HTTP/1.0\r\nHost: probe\r\n\r\n",
+    8443:  None,
+    9200:  b"GET / HTTP/1.0\r\nHost: probe\r\n\r\n",  # Elasticsearch
+    27017: b"",                                   # MongoDB
+}
+
+
+def _grab_banner_raw(ip, port, timeout):
+    """Open a fresh connection, optionally send a probe, and return raw bytes."""
+    probe = _PROBES.get(port, b"")  # default: just read the banner
+    recv_timeout = min(2.0, timeout + 0.5)
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            sock.settimeout(recv_timeout)
+            if probe:  # None means TLS-wrapped; handled separately
+                sock.sendall(probe)
+            chunks = []
+            try:
+                while True:
+                    chunk = sock.recv(512)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if sum(len(c) for c in chunks) >= 2048:
+                        break
+            except (socket.timeout, OSError):
+                pass
+            return b"".join(chunks)
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return b""
+
+
+def _grab_tls_banner(ip, port, timeout):
+    """Wrap connection in TLS and return (decoded_banner, tls_version, cert_info)."""
+    recv_timeout = min(2.0, timeout + 0.5)
+    tls_version = None
+    cert_info = {}
+    banner = ""
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        # Also try to get the negotiated TLS version
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            raw.settimeout(recv_timeout)
+            with ctx.wrap_socket(raw, server_hostname=ip) as tls:
+                tls_version = tls.version()  # e.g. 'TLSv1.2'
+                cert = tls.getpeercert()
+                if cert:
+                    cert_info["subject"] = dict(x[0] for x in cert.get("subject", []))
+                    cert_info["not_after"] = cert.get("notAfter", "")
+                # Try to get HTTP banner
+                try:
+                    tls.sendall(b"HEAD / HTTP/1.0\r\nHost: probe\r\n\r\n")
+                    data = b""
+                    while True:
+                        chunk = tls.recv(512)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) >= 2048:
+                            break
+                except (socket.timeout, OSError):
+                    pass
+                banner = data.decode(errors="ignore").strip()
+    except (ssl.SSLError, socket.timeout, ConnectionRefusedError, OSError):
+        pass
+    return banner, tls_version, cert_info
+
+
+def _score_to_level(score):
+    """Convert a numeric score (0-10) into a risk level label."""
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    if score >= 2.0:
+        return "LOW"
+    return "INFO"
+
+
+def dynamic_risk_probe(ip, port, timeout):
+    """Probe an open port with protocol-specific packets and return a rich dict.
+
+    Returns:
+        {
+          'banner': str,          # first line of the raw response
+          'full_banner': str,     # multi-line / full decoded response
+          'risk': str,            # CRITICAL / HIGH / MEDIUM / LOW / INFO
+          'score': float,         # 0.0 – 10.0
+          'evidence': [str],      # human-readable findings driving the score
+          'recommendation': str,  # actionable remediation text
+          'service': str,
+          'tls_version': str|None,
+        }
+    """
+    base_info = PORT_SECURITY.get(port)
+    base_score = base_info["score"] if base_info else (5.0 if port < 1024 else 2.0)
+    base_rec = (
+        base_info["recommendation"]
+        if base_info
+        else (
+            "Privileged system port. Verify necessity and restrict access."
+            if port < 1024
+            else "Non-standard port. Adhere to least privilege and keep software updated."
+        )
+    )
+    service_name = base_info["service"] if base_info else SERVICES.get(port, "unknown")
+
+    evidence = []
+    score_delta = 0.0
+    tls_version = None
+    full_banner = ""
+
+    # --- TLS-wrapped ports ---
+    is_tls_port = _PROBES.get(port) is None
+    if is_tls_port:
+        full_banner, tls_version, cert_info = _grab_tls_banner(ip, port, timeout)
+        if tls_version:
+            weak_tls = tls_version in ("TLSv1", "TLSv1.1", "SSLv2", "SSLv3")
+            if weak_tls:
+                score_delta += 2.0
+                evidence.append(
+                    f"Weak TLS version negotiated: {tls_version} — vulnerable to known downgrade attacks"
+                )
+            else:
+                evidence.append(f"TLS version: {tls_version} (acceptable)")
+            # Check certificate expiry
+            not_after = cert_info.get("not_after", "")
+            if not_after:
+                try:
+                    exp = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                    days_left = (exp - datetime.datetime.utcnow()).days
+                    if days_left < 0:
+                        score_delta += 2.0
+                        evidence.append(f"TLS certificate EXPIRED {abs(days_left)} day(s) ago")
+                    elif days_left < 30:
+                        score_delta += 1.0
+                        evidence.append(f"TLS certificate expires in {days_left} day(s) — renew soon")
+                    else:
+                        evidence.append(f"TLS certificate valid for {days_left} more day(s)")
+                except ValueError:
+                    pass
+        else:
+            score_delta += 1.0
+            evidence.append("TLS handshake failed — service may be using plain text on an encrypted port")
+    else:
+        # --- Plain-text probe ---
+        raw = _grab_banner_raw(ip, port, timeout)
+        full_banner = raw.decode(errors="ignore").strip()
+
+    banner_line = full_banner.splitlines()[0] if full_banner else ""
+
+    # --- Pattern matching against the full banner ---
+    for pattern, penalty, note in _VULN_PATTERNS:
+        m = pattern.search(full_banner)
+        if not m:
+            continue
+        # Version-aware patterns (penalty is None → look up _OLD_VERSION_PENALTIES)
+        if penalty is None:
+            # Try to extract major.minor from match groups
+            try:
+                major = int(m.group(1))
+                minor = int(m.group(2)) if len(m.groups()) >= 2 else 0
+            except (IndexError, ValueError):
+                continue
+            # Determine service key from the pattern note
+            svc_key = None
+            for k in _OLD_VERSION_PENALTIES:
+                if k in note.lower():
+                    svc_key = k
+                    break
+            if svc_key:
+                cutoff_major, cutoff_minor = _OLD_VERSION_PENALTIES[svc_key][0]
+                pen, old_note = _OLD_VERSION_PENALTIES[svc_key][1], _OLD_VERSION_PENALTIES[svc_key][2]
+                if (major, minor) < (cutoff_major, cutoff_minor):
+                    score_delta += pen
+                    evidence.append(
+                        f"{note}: {major}.{minor} — {old_note}"
+                    )
+                else:
+                    evidence.append(f"{note}: {major}.{minor} (up-to-date)")
+            else:
+                evidence.append(f"{note}: {m.group(0)}")
+        else:
+            score_delta += penalty
+            evidence.append(note)
+
+    # Default evidence if nothing matched
+    if not evidence:
+        if full_banner:
+            evidence.append(f"Service responded. Banner: {banner_line[:120]}")
+        else:
+            evidence.append("Port is open but service did not return a detectable banner.")
+
+    final_score = min(10.0, round(base_score + score_delta, 1))
+    risk_level = _score_to_level(final_score)
+
+    return {
+        "banner": banner_line,
+        "full_banner": full_banner,
+        "service": service_name,
+        "risk": risk_level,
+        "score": final_score,
+        "evidence": evidence,
+        "recommendation": base_rec,
+        "tls_version": tls_version,
+    }
+
+
 def assess_port(port, service_name=None):
-    """Return security metadata and risk rating for a port."""
+    """Return static security metadata for a port (used as a baseline)."""
     info = PORT_SECURITY.get(port)
     if info:
         svc = service_name or info.get("service") or SERVICES.get(port, "unknown")
@@ -396,17 +707,21 @@ def scan_target_port(host, ip, port, timeout, cancel_event=None, mode="connect",
         return None
     res = scan_port(ip, port, timeout, cancel_event, mode, engine)
     if res:
-        port_num, banner = res
-        sec = assess_port(port_num)
+        port_num, _quick_banner = res
+        # Run dynamic risk probe for a real, evidence-backed risk assessment
+        probe = dynamic_risk_probe(ip, port_num, timeout)
         return {
             "host": host,
             "ip": ip,
             "port": port_num,
-            "service": sec["service"],
-            "banner": banner,
-            "risk": sec["risk"],
-            "score": sec["score"],
-            "recommendation": sec["recommendation"],
+            "service": probe["service"],
+            "banner": probe["banner"],
+            "full_banner": probe["full_banner"],
+            "risk": probe["risk"],
+            "score": probe["score"],
+            "evidence": probe["evidence"],
+            "recommendation": probe["recommendation"],
+            "tls_version": probe["tls_version"],
         }
     return None
 

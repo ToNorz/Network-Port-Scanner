@@ -188,7 +188,7 @@ function loadPrefs() {
 
 function matches(hit, query) {
   if (!query) return true;
-  const target = `${hit.host || ""} ${hit.ip || ""} ${hit.port} ${hit.service || ""} ${hit.risk || ""} ${hit.banner || ""} ${hit.recommendation || ""}`.toLowerCase();
+  const target = `${hit.host || ""} ${hit.ip || ""} ${hit.port} ${hit.service || ""} ${hit.risk || ""} ${hit.banner || ""} ${hit.recommendation || ""} ${(hit.evidence || []).join(" ")}`.toLowerCase();
   return target.includes(query);
 }
 
@@ -292,6 +292,37 @@ function renderRiskAndRecommendations() {
       text.textContent = rec.recommendation;
 
       card.append(header, text);
+
+      // Evidence — dynamic findings from the live probe
+      const evidence = rec.evidence || [];
+      if (evidence.length > 0) {
+        const evSection = document.createElement("div");
+        evSection.className = "rec-evidence";
+
+        const evLabel = document.createElement("span");
+        evLabel.className = "rec-evidence-label";
+        evLabel.textContent = "🔍 Dynamic Findings";
+        evSection.append(evLabel);
+
+        const ul = document.createElement("ul");
+        ul.className = "rec-evidence-list";
+        for (const finding of evidence) {
+          const li = document.createElement("li");
+          li.textContent = finding;
+          ul.append(li);
+        }
+        evSection.append(ul);
+        card.append(evSection);
+      }
+
+      // TLS info badge if present
+      if (rec.tls_version) {
+        const tlsBadge = document.createElement("span");
+        tlsBadge.className = "tls-badge";
+        tlsBadge.textContent = `🔒 ${rec.tls_version}`;
+        card.append(tlsBadge);
+      }
+
       fragment.append(card);
     }
     recommendationsList.replaceChildren(fragment);
@@ -335,8 +366,15 @@ function renderRows() {
 
     const banner = document.createElement("td");
     banner.className = "td-banner";
-    banner.textContent = hit.banner || "—";
-    if (hit.banner) banner.title = hit.banner;
+    let bannerText = hit.banner || "—";
+    if (hit.tls_version) bannerText = `[${hit.tls_version}] ${bannerText}`;
+    banner.textContent = bannerText;
+    if (hit.banner) banner.title = hit.full_banner || hit.banner;
+    // Show evidence as tooltip on the risk badge
+    if (hit.evidence && hit.evidence.length > 0) {
+      badge.title = hit.evidence.join("\n");
+      badge.style.cursor = "help";
+    }
 
     row.append(port, service, riskTd, banner);
 
