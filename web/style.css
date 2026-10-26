@@ -116,6 +116,90 @@ form.panel { padding: 20px; }
   align-items: end;
 }
 
+.mode {
+  margin: 14px 0 0;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
+}
+
+.mode legend {
+  margin: 0;
+  padding: 0;
+  color: var(--dim);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.mode-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.mode-option {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #111315;
+  cursor: pointer;
+}
+
+.mode-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+}
+
+.mode-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-glow);
+}
+
+.mode-option:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mode-name {
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  text-transform: none;
+}
+
+.mode-desc {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.mode:disabled {
+  opacity: 0.55;
+}
+
+.mode:disabled .mode-option {
+  cursor: not-allowed;
+}
+
+.mode-hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.mode-hint.warn { color: var(--warn); }
+
 .controls {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -527,7 +611,7 @@ code {
 
 @media (max-width: 760px) {
   .page { width: min(100% - 24px, 940px); padding-top: 22px; }
-  .top, .results-head, .target-row, .controls { display: grid; grid-template-columns: 1fr; }
+  .top, .results-head, .target-row, .controls, .mode-options { display: grid; grid-template-columns: 1fr; }
   .pill { justify-self: start; }
   .scan-btn, .results-actions button { width: 100%; }
   .results-actions { display: grid; grid-template-columns: 1fr; }
