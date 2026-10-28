@@ -685,31 +685,80 @@ def scan_port(host, port, timeout, cancel_event=None, mode="connect", engine=Non
         if engine.probe(host, port, timeout, cancel_event):
             return port, ""
         return None
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            banner = ""
-            try:
-                sock.settimeout(min(1.0, timeout))
-                if port in (80, 8080):
-                    sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
-                data = sock.recv(100).decode(errors="ignore").strip()
-                banner = data.splitlines()[0] if data else ""
-            except (socket.timeout, OSError):
-                pass
-            return port, banner
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return None
+    attempts = 2
+    for attempt in range(attempts):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                banner = ""
+                try:
+                    sock.settimeout(min(0.25, timeout))
+                    if port in (80, 8080):
+                        sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+                    data = sock.recv(100).decode(errors="ignore").strip()
+                    banner = data.splitlines()[0] if data else ""
+                except (socket.timeout, OSError):
+                    pass
+                return port, banner
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            if attempt < attempts - 1 and (cancel_event is None or not cancel_event.is_set()):
+                time.sleep(0.06)
+                continue
+            return None
 
 
 def scan_target_port(host, ip, port, timeout, cancel_event=None, mode="connect", engine=None):
-    """Worker task returning enriched result dictionary if port is open."""
+    """Worker task returning enriched result dictionary if port is open.
+
+    The port is confirmed open by scan_port() first.  Only then is a second
+    connection attempted for banner / risk enrichment.  If that second probe
+    fails for any reason (rate-limiting, firewall, timeout) the port is still
+    reported as open using static baseline metadata so the confirmed-open port
+    is never silently dropped from results.
+
+    In stealth mode the scanner deliberately does NOT complete a TCP handshake
+    during the detection phase.  Opening a second connect-mode connection just
+    to grab a banner would break stealth semantics, so we skip it and fall back
+    to the static PORT_SECURITY baseline instead.
+    """
     if cancel_event is not None and cancel_event.is_set():
         return None
     res = scan_port(ip, port, timeout, cancel_event, mode, engine)
-    if res:
-        port_num, _quick_banner = res
-        # Run dynamic risk probe for a real, evidence-backed risk assessment
+    if not res:
+        return None
+    port_num, _quick_banner = res
+
+    # Stealth scans intentionally leave the handshake unfinished.  Opening a
+    # full TCP connection for banner grabbing would defeat the stealth purpose
+    # and introduce a second, independent network event that can fail even when
+    # the port is genuinely open.  Use static metadata only.
+    if normalize_mode(mode) == MODE_STEALTH:
+        static = assess_port(port_num)
+        return {
+            "host": host,
+            "ip": ip,
+            "port": port_num,
+            "service": static["service"],
+            "banner": "",
+            "full_banner": "",
+            "risk": static["risk"],
+            "score": static["score"],
+            "evidence": ["Stealth SYN scan: port responded with SYN-ACK (banner grab skipped to preserve stealth semantics)."],
+            "recommendation": static["recommendation"],
+            "tls_version": None,
+        }
+
+    # Connect mode: attempt banner / risk enrichment via a second connection.
+    # If the probe fails for any reason (rate-limiting, firewall, timeout) we
+    # still report the port as open using the static baseline so a confirmed-open
+    # port is never silently dropped from results.
+    try:
         probe = dynamic_risk_probe(ip, port_num, timeout)
+    except Exception:
+        probe = None
+
+    if probe is not None:
         return {
             "host": host,
             "ip": ip,
@@ -723,7 +772,22 @@ def scan_target_port(host, ip, port, timeout, cancel_event=None, mode="connect",
             "recommendation": probe["recommendation"],
             "tls_version": probe["tls_version"],
         }
-    return None
+
+    # Fallback: probe failed but port is confirmed open — use static metadata.
+    static = assess_port(port_num)
+    return {
+        "host": host,
+        "ip": ip,
+        "port": port_num,
+        "service": static["service"],
+        "banner": _quick_banner,
+        "full_banner": "",
+        "risk": static["risk"],
+        "score": static["score"],
+        "evidence": ["Port is open (banner probe timed out or was refused; static risk baseline used)."],
+        "recommendation": static["recommendation"],
+        "tls_version": None,
+    }
 
 
 def scan_host(ip, ports, timeout, threads, on_result=None, cancel_event=None, mode="connect"):
@@ -740,15 +804,26 @@ def scan_host(ip, ports, timeout, threads, on_result=None, cancel_event=None, mo
     if total == 0:
         return open_ports
 
+    is_remote = False
+    try:
+        addr = ipaddress.ip_address(ip)
+        is_remote = not (addr.is_loopback or addr.is_private)
+    except ValueError:
+        pass
+
+    worker_limit = min(threads, total, 16 if is_remote else threads)
     checked = 0
-    pool = ThreadPoolExecutor(max_workers=min(threads, total))
+    pool = ThreadPoolExecutor(max_workers=max(1, worker_limit))
     cancelled = False
     try:
         with open_engine(mode) as (mode, engine):
-            pending = {
-                pool.submit(scan_port, ip, port, timeout, cancel_event, mode, engine)
-                for port in ports
-            }
+            pending = set()
+            for port in ports:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                pending.add(pool.submit(scan_port, ip, port, timeout, cancel_event, mode, engine))
+                if is_remote and total > 1:
+                    time.sleep(0.012)
             while pending:
                 try:
                     done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
@@ -806,17 +881,33 @@ def scan_all_targets(targets, ports, timeout, threads, on_result=None, cancel_ev
     if total == 0:
         return results
 
+    # Apply adaptive concurrency: single remote hosts throttle concurrent TCP/SYN bursts
+    # so we cap workers and apply micro-pacing to avoid triggering remote rate-limiters.
+    is_single_remote = False
+    if len(targets) == 1:
+        try:
+            addr = ipaddress.ip_address(targets[0][1])
+            is_single_remote = not (addr.is_loopback or addr.is_private)
+        except ValueError:
+            pass
+
+    worker_limit = min(threads, total, 16 if is_single_remote else threads)
     checked = 0
-    pool = ThreadPoolExecutor(max_workers=min(threads, total))
+    pool = ThreadPoolExecutor(max_workers=max(1, worker_limit))
     cancelled = False
     try:
         with open_engine(mode) as (mode, engine):
-            pending = {
-                pool.submit(
-                    scan_target_port, host, ip, port, timeout, cancel_event, mode, engine
+            pending = set()
+            for host, ip, port in tasks:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                pending.add(
+                    pool.submit(
+                        scan_target_port, host, ip, port, timeout, cancel_event, mode, engine
+                    )
                 )
-                for host, ip, port in tasks
-            }
+                if is_single_remote and len(tasks) > 1:
+                    time.sleep(0.012)
             while pending:
                 try:
                     done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
